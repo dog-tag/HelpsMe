@@ -1,0 +1,109 @@
+Setting up a custom PyPi server
+Introduction
+
+Whilst I’ve got Jenkins to help me build and test and catch common errors like failing unit tests, slipping test coverage and PEP8 violations. I always find that I spot really stupid errors after I’ve released a version into the wild via PyPI. So to cull the comedy of errors that is my release cycle, I’ve decided to setup a private PyPI server using PyPiServer and this post outlines how I set it up.
+Overview
+
+I’m going to be setting up the PyPi server in a virtualenv to be controlled by supervisord and set up Nginx SSL virtualhost as a frontend from which I’ll reverse proxy to the PyPi server.
+Setting up PyPi
+
+This is nothing to complicated, it’s a simple case of making a directory, creating/activating the virtualenv and installing the package –
+
+# set up the directories
+mkdir -p ~/pypi/packages
+cd ~/pypi
+# set up the virtualenv and activate it
+virtualenv venv
+. ./venv/bin/activate
+# install the payload
+pip install pypiserver
+
+You should now be able to test the pypi server by firing it up –
+
+$ pypi-server -p 7001 ~/pypi/packages
+This is pypiserver 1.1.3 serving '/home/jamiecurle/pypi/packages' on http://0.0.0.0:7001
+
+Bottle v0.11.6 server starting up (using AutoServer())...
+Listening on http://0.0.0.0:7001/
+Hit Ctrl-C to quit.
+
+Controlling the process via supervisord
+
+I’m a big fan of controlling stuff via supervisord because it’s ace and really easy to set up. Here’s the config file I’ve used –
+
+[program:pypi]
+command=/home/jamiecurle/pypi/venv/bin/pypi-server -p 7001 /home/jamiecurle/pypi/packages
+directory=/home/jamiecurle/pypi
+user=jamiecurle
+autostart=true
+autorestart=true
+redirect_stderr=true
+
+You need to put that somewhere that supervisord can get to it and then add it via supervisorctl –
+
+$ supervisorctl
+$ supervisor> reread
+    pypi: available
+$ supervisor> add pypi
+    pypi: added process group
+$supervisor> status
+pypi                             RUNNING    pid 13797, uptime 0:00:02
+# bingo
+
+Finally, reverse proxy through Nginx
+
+I always like to use Nginx as a reverse proxy rather than exposing services directly to the web. Maybe someone can tell me that I’m wrong, but it does feel like I have a very competant doorman watching over every HTTP request that comes into my server.
+
+Here’s the config file that I’ve used –
+
+upstream pypi {
+  server 127.0.0.1:7001 fail_timeout=0;
+}
+
+server {
+  listen 80;
+  server_name pip.curle.io;
+  rewrite ^ https://$server_name$request_uri? permanent;
+}
+
+server {
+  listen 443 ssl;
+  server_name pip.curle.io;
+
+  ssl_certificate           /etc/ssl/certs/curle.io.pem;
+  ssl_certificate_key       /etc/ssl/private/curle.io.key;
+
+  ssl_session_timeout  5m;
+  ssl_protocols  SSLv3 TLSv1;
+  ssl_ciphers HIGH:!ADH:!MD5;
+  ssl_prefer_server_ciphers on;
+
+  location / {
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    add_header Pragma "no-cache";
+    proxy_pass http://pypi;
+  }
+}
+
+Once that’s been symlinked somewhere that nginx can read the config restart nginx and you should be good to go.
+
+sudo service nginx reload
+
+Boom.
+Configuring pip to search local indexes
+
+The last thing I want to be doing is always specifying the url for my custom index, so a quick configuration of ~/.pip/pip.conf is in order –
+
+[global]
+index-url = https://pip.curle.io/simple/
+
+Enabling uploads
+
+Initially I wasn’t going to allow uploads, but then I changed my mind. Once again the installation instructions on how to enable uploads were a charm.
+
+It did however, mean I had to make a change to the supervisor ini file on line 2
+
+command=/home/jamiecurle/pypi/venv/bin/pypi-server -p 7001 -P /home/jamiecurle/pypi/.htaccess /home/jamiecurle/pypi/packages
